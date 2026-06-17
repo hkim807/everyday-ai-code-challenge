@@ -1,0 +1,17 @@
+{
+  "name": "pitchside-kickoff-verification",
+  "version": "0.1.0",
+  "description": "Read-only kickoff verification recon tool for Pitchside.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "luxon": "^3.5.0",
+    "openai": "^4.76.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
