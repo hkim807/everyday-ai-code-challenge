@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { DateTime } from "luxon";
 
 const API_BASE_URL =
@@ -13,6 +13,7 @@ const RUN_EXTRACTION = process.env.RUN_EXTRACTION === "1";
 const RUN_NORMALIZATION = process.env.RUN_NORMALIZATION === "1";
 const RUN_CLASSIFICATION = process.env.RUN_CLASSIFICATION === "1";
 const RUN_VERDICTS = process.env.RUN_VERDICTS === "1";
+const RUN_REPORT = process.env.RUN_REPORT === "1";
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 const FRESHNESS_WINDOW_DAYS = 14;
 
@@ -983,11 +984,207 @@ function printVerdict(fixture, rows, evidenceUnavailable = false) {
   return verdict;
 }
 
+function actionNeeded(verdict) {
+  return (
+    verdict.verdict === "Change recommended" ||
+    verdict.verdict === "Flagged (needs review)"
+  );
+}
+
+function kickoffMillis(fixture) {
+  return utcMillis(fixture.kickoff_utc) ?? Number.MAX_SAFE_INTEGER;
+}
+
+function shiftMagnitudeMs(item) {
+  const currentMillis = utcMillis(item.fixture.kickoff_utc);
+  if (currentMillis === null) {
+    return 0;
+  }
+
+  const candidateTimes = [
+    item.verdict.recommended_kickoff_utc,
+    ...(item.verdict.candidate_kickoff_utc_values ?? []),
+    ...item.verdict.receipts.map((receipt) => receipt.candidate_kickoff_utc),
+  ].filter(Boolean);
+
+  const shifts = candidateTimes
+    .map((time) => utcMillis(time))
+    .filter((millis) => millis !== null)
+    .map((millis) => Math.abs(millis - currentMillis));
+
+  return shifts.length > 0 ? Math.max(...shifts) : 0;
+}
+
+function rankReportItems(items) {
+  const actionItems = items
+    .filter((item) => actionNeeded(item.verdict))
+    .sort((left, right) => {
+      const kickoffDiff = kickoffMillis(left.fixture) - kickoffMillis(right.fixture);
+      if (kickoffDiff !== 0) {
+        return kickoffDiff;
+      }
+
+      return shiftMagnitudeMs(right) - shiftMagnitudeMs(left);
+    });
+  const quietItems = items
+    .filter((item) => !actionNeeded(item.verdict))
+    .sort((left, right) => kickoffMillis(left.fixture) - kickoffMillis(right.fixture));
+
+  return [...actionItems, ...quietItems];
+}
+
+function formatFixtureName(fixture) {
+  return `${fixture.home} vs ${fixture.away}`;
+}
+
+function recommendedText(verdict) {
+  if (verdict.verdict === "Flagged (needs review)") {
+    return "none - flag";
+  }
+
+  return verdict.recommended_kickoff_utc ?? "none";
+}
+
+function receiptText(receipts) {
+  if (receipts.length === 0) {
+    return "none";
+  }
+
+  return receipts
+    .map(
+      (receipt) =>
+        `${receipt.source_id} (${receipt.source_type}, ${receipt.evidence_timestamp ?? "no timestamp"}, tier ${receipt.trust_tier}, ${receipt.freshness})`,
+    )
+    .join("; ");
+}
+
+function renderConsoleReport(items) {
+  console.log("\nPitchside Kickoff Verification Report");
+  console.log(`Generated: ${DateTime.utc().toISO()}`);
+  console.log("\nAction needed");
+  const actionItems = items.filter((item) => actionNeeded(item.verdict));
+  if (actionItems.length === 0) {
+    console.log("  None");
+  }
+  for (const item of actionItems) {
+    console.log(
+      `- ${item.fixture.id} ${formatFixtureName(item.fixture)} | ${item.verdict.verdict} | recommended: ${recommendedText(item.verdict)}`,
+    );
+    console.log(`  Why: ${item.verdict.why}`);
+    console.log(`  Receipts: ${receiptText(item.verdict.receipts)}`);
+  }
+
+  console.log("\nQuiet roster");
+  for (const item of items.filter((entry) => !actionNeeded(entry.verdict))) {
+    console.log(
+      `- ${item.fixture.id} ${formatFixtureName(item.fixture)} | ${item.verdict.verdict} | recommended: ${recommendedText(item.verdict)}`,
+    );
+    console.log(`  Why: ${item.verdict.why}`);
+    console.log(`  Receipts: ${receiptText(item.verdict.receipts)}`);
+  }
+}
+
+function renderMarkdownReport(items) {
+  const lines = [
+    "# Pitchside Kickoff Verification Report",
+    "",
+    `Generated: ${DateTime.utc().toISO()}`,
+    "",
+    "## Action Needed",
+    "",
+  ];
+
+  const actionItems = items.filter((item) => actionNeeded(item.verdict));
+  if (actionItems.length === 0) {
+    lines.push("None.", "");
+  }
+
+  for (const item of actionItems) {
+    lines.push(
+      `### ${item.fixture.id} - ${formatFixtureName(item.fixture)}`,
+      "",
+      `- Verdict: ${item.verdict.verdict}`,
+      `- Current feed kickoff: ${item.fixture.kickoff_utc}`,
+      `- Recommended: ${recommendedText(item.verdict)}`,
+      `- Why: ${item.verdict.why}`,
+      `- Receipts: ${receiptText(item.verdict.receipts)}`,
+      "",
+    );
+  }
+
+  lines.push("## Quiet Roster", "");
+  for (const item of items.filter((entry) => !actionNeeded(entry.verdict))) {
+    lines.push(
+      `### ${item.fixture.id} - ${formatFixtureName(item.fixture)}`,
+      "",
+      `- Verdict: ${item.verdict.verdict}`,
+      `- Current feed kickoff: ${item.fixture.kickoff_utc}`,
+      `- Recommended: ${recommendedText(item.verdict)}`,
+      `- Why: ${item.verdict.why}`,
+      `- Receipts: ${receiptText(item.verdict.receipts)}`,
+      "",
+    );
+  }
+
+  return `${lines.join("\n").trim()}\n`;
+}
+
+async function assessFixture(fixture) {
+  const evidence = await fetchEvidenceForFixture(fixture.id);
+
+  if (evidence.evidence_unavailable) {
+    return {
+      fixture,
+      evidence_unavailable: true,
+      verdict: classifyVerdict(fixture, [], true),
+      candidates: [],
+    };
+  }
+
+  const extractions = await extractEvidenceForFixture(fixture, evidence);
+  const normalizedRows = extractions.map((extraction) =>
+    normalizeExtractionToUtc(extraction, fixture),
+  );
+  const classifiedRows = classifyNormalizedCandidates(fixture, normalizedRows);
+
+  return {
+    fixture,
+    evidence_unavailable: false,
+    verdict: classifyVerdict(fixture, classifiedRows),
+    candidates: classifiedRows,
+  };
+}
+
+async function runReport(fixtureList) {
+  const assessedItems = [];
+
+  for (const fixture of fixtureList) {
+    assessedItems.push(await assessFixture(fixture));
+  }
+
+  const rankedItems = rankReportItems(assessedItems);
+  const report = {
+    generated_at: DateTime.utc().toISO(),
+    freshness_window_days: FRESHNESS_WINDOW_DAYS,
+    items: rankedItems,
+  };
+
+  renderConsoleReport(rankedItems);
+  writeFileSync("report.json", `${JSON.stringify(report, null, 2)}\n`);
+  writeFileSync("report.md", renderMarkdownReport(rankedItems));
+  console.log("\nWrote report.json and report.md");
+}
+
 async function main() {
   loadDotEnv();
 
   const fixtures = await fetchJson(`${API_BASE_URL}/fixtures`);
   const fixtureList = Array.isArray(fixtures) ? fixtures : fixtures.fixtures ?? [];
+
+  if (RUN_REPORT) {
+    await runReport(fixtureList);
+    return;
+  }
 
   console.log("=== Fixtures payload ===");
   console.dir(fixtures, { depth: null });
