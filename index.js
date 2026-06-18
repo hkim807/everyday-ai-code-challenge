@@ -12,6 +12,7 @@ const FORCED_FAILURE_FIXTURE_ID = process.env.FORCE_EVIDENCE_FAILURE_ID;
 const RUN_EXTRACTION = process.env.RUN_EXTRACTION === "1";
 const RUN_NORMALIZATION = process.env.RUN_NORMALIZATION === "1";
 const RUN_CLASSIFICATION = process.env.RUN_CLASSIFICATION === "1";
+const RUN_VERDICTS = process.env.RUN_VERDICTS === "1";
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 const FRESHNESS_WINDOW_DAYS = 14;
 
@@ -654,6 +655,9 @@ function normalizeExtractionToUtc(extraction, fixture) {
       account: extraction.account,
       url: extraction.url,
       evidence_timestamp: extraction.evidence_timestamp,
+      is_postponed_or_cancelled: extraction.is_postponed_or_cancelled,
+      is_this_about_this_fixture: extraction.is_this_about_this_fixture,
+      is_this_actually_kickoff: extraction.is_this_actually_kickoff,
       candidate_kickoff_time_local: extraction.candidate_kickoff_time_local,
       stated_timezone: extraction.stated_timezone,
       referenced_date_or_weekday: extraction.referenced_date_or_weekday,
@@ -677,6 +681,9 @@ function normalizeExtractionToUtc(extraction, fixture) {
       account: extraction.account,
       url: extraction.url,
       evidence_timestamp: extraction.evidence_timestamp,
+      is_postponed_or_cancelled: extraction.is_postponed_or_cancelled,
+      is_this_about_this_fixture: extraction.is_this_about_this_fixture,
+      is_this_actually_kickoff: extraction.is_this_actually_kickoff,
       candidate_kickoff_time_local: extraction.candidate_kickoff_time_local,
       stated_timezone: extraction.stated_timezone,
       referenced_date_or_weekday: extraction.referenced_date_or_weekday,
@@ -704,6 +711,9 @@ function normalizeExtractionToUtc(extraction, fixture) {
     account: extraction.account,
     url: extraction.url,
     evidence_timestamp: extraction.evidence_timestamp,
+    is_postponed_or_cancelled: extraction.is_postponed_or_cancelled,
+    is_this_about_this_fixture: extraction.is_this_about_this_fixture,
+    is_this_actually_kickoff: extraction.is_this_actually_kickoff,
     candidate_kickoff_time_local: extraction.candidate_kickoff_time_local,
     stated_timezone: extraction.stated_timezone,
     referenced_date_or_weekday: extraction.referenced_date_or_weekday,
@@ -794,6 +804,7 @@ function classifyTrustTier(row, fixture) {
 function classifyFreshness(row, fixture) {
   const evidenceTime = DateTime.fromISO(row.evidence_timestamp ?? "", { zone: "utc" });
   const lastVerifiedAt = DateTime.fromISO(fixture.last_verified_at, { zone: "utc" });
+  const now = DateTime.utc();
 
   if (!evidenceTime.isValid) {
     return {
@@ -811,14 +822,18 @@ function classifyFreshness(row, fixture) {
     };
   }
 
-  const ageDays = evidenceTime.diff(lastVerifiedAt, "days").days;
+  const daysAfterLastVerified = evidenceTime.diff(lastVerifiedAt, "days").days;
+  const ageDays = Math.max(0, now.diff(evidenceTime, "days").days);
   const freshness =
-    ageDays >= 0 && ageDays <= FRESHNESS_WINDOW_DAYS ? "fresh" : "stale";
+    daysAfterLastVerified >= 0 && ageDays <= FRESHNESS_WINDOW_DAYS
+      ? "fresh"
+      : "stale";
 
   return {
     freshness,
     freshness_age_days: Number(ageDays.toFixed(2)),
-    freshness_note: `${freshness} relative to last_verified_at using ${FRESHNESS_WINDOW_DAYS}-day window.`,
+    freshness_days_after_last_verified: Number(daysAfterLastVerified.toFixed(2)),
+    freshness_note: `${freshness}: evidence is ${Number(ageDays.toFixed(2))} days old and ${Number(daysAfterLastVerified.toFixed(2))} days after last_verified_at using ${FRESHNESS_WINDOW_DAYS}-day window.`,
   };
 }
 
@@ -850,6 +865,124 @@ function printClassifiedCandidates(fixture, normalizedRows) {
   return rows;
 }
 
+function receiptForRow(row) {
+  return {
+    source_id: row.source_id,
+    source_type: row.source_type,
+    evidence_timestamp: row.evidence_timestamp,
+    candidate_kickoff_utc: row.candidate_kickoff_utc,
+    trust_tier: row.trust_tier,
+    freshness: row.freshness,
+  };
+}
+
+function utcMillis(value) {
+  const parsed = DateTime.fromISO(value ?? "", { zone: "utc" });
+  return parsed.isValid ? parsed.toMillis() : null;
+}
+
+function sameUtcInstant(left, right) {
+  const leftMillis = utcMillis(left);
+  const rightMillis = utcMillis(right);
+  return leftMillis !== null && rightMillis !== null && leftMillis === rightMillis;
+}
+
+function uniqueUtcTimes(rows) {
+  const times = [];
+
+  for (const row of rows) {
+    if (
+      row.candidate_kickoff_utc &&
+      !times.some((time) => sameUtcInstant(time, row.candidate_kickoff_utc))
+    ) {
+      times.push(row.candidate_kickoff_utc);
+    }
+  }
+
+  return times;
+}
+
+function rowsForUtc(rows, utc) {
+  return rows.filter((row) => sameUtcInstant(row.candidate_kickoff_utc, utc));
+}
+
+function classifyVerdict(fixture, rows, evidenceUnavailable = false) {
+  if (evidenceUnavailable) {
+    return {
+      fixture_id: fixture.id,
+      verdict: "Insufficient evidence",
+      recommended_kickoff_utc: null,
+      why: "Evidence unavailable for this fixture; current feed time is not verified.",
+      receipts: [],
+    };
+  }
+
+  const postponedRows = rows.filter((row) => row.is_postponed_or_cancelled);
+  if (postponedRows.length > 0 || fixture.status === "postponed") {
+    return {
+      fixture_id: fixture.id,
+      verdict: "Flagged (needs review)",
+      recommended_kickoff_utc: null,
+      why: "Postponed/cancelled signal present; do not propose a new kickoff time.",
+      receipts: postponedRows.map(receiptForRow),
+    };
+  }
+
+  const freshTier1Rows = rows.filter(
+    (row) => row.trust_tier === 1 && row.freshness === "fresh" && row.candidate_kickoff_utc,
+  );
+  const tier1Times = uniqueUtcTimes(freshTier1Rows);
+
+  if (tier1Times.length > 1) {
+    return {
+      fixture_id: fixture.id,
+      verdict: "Flagged (needs review)",
+      recommended_kickoff_utc: null,
+      candidate_kickoff_utc_values: tier1Times,
+      why: "Fresh Tier 1 sources disagree on kickoff time.",
+      receipts: freshTier1Rows.map(receiptForRow),
+    };
+  }
+
+  if (tier1Times.length === 1 && !sameUtcInstant(tier1Times[0], fixture.kickoff_utc)) {
+    const recommended = tier1Times[0];
+    return {
+      fixture_id: fixture.id,
+      verdict: "Change recommended",
+      recommended_kickoff_utc: recommended,
+      why: "Fresh Tier 1 source supports a new kickoff time with no Tier 1 clash.",
+      receipts: rowsForUtc(freshTier1Rows, recommended).map(receiptForRow),
+    };
+  }
+
+  if (tier1Times.length === 1 && sameUtcInstant(tier1Times[0], fixture.kickoff_utc)) {
+    return {
+      fixture_id: fixture.id,
+      verdict: "Confirmed (no change)",
+      recommended_kickoff_utc: null,
+      why: "Fresh Tier 1 source corroborates the current feed time.",
+      receipts: rowsForUtc(freshTier1Rows, fixture.kickoff_utc).map(receiptForRow),
+    };
+  }
+
+  return {
+    fixture_id: fixture.id,
+    verdict: "Insufficient evidence",
+    recommended_kickoff_utc: null,
+    why: "No fresh Tier 1 kickoff candidate; ScoreFeed/web/stale-only evidence cannot trigger a verdict.",
+    receipts: rows.map(receiptForRow),
+  };
+}
+
+function printVerdict(fixture, rows, evidenceUnavailable = false) {
+  const verdict = classifyVerdict(fixture, rows, evidenceUnavailable);
+
+  console.log(`\n=== Verdict for fixture ${fixture.id} ===`);
+  console.dir(verdict, { depth: null });
+
+  return verdict;
+}
+
 async function main() {
   loadDotEnv();
 
@@ -879,18 +1012,24 @@ async function main() {
     }
 
     if (
-      (RUN_EXTRACTION || RUN_NORMALIZATION || RUN_CLASSIFICATION) &&
+      (RUN_EXTRACTION || RUN_NORMALIZATION || RUN_CLASSIFICATION || RUN_VERDICTS) &&
       !evidence.evidence_unavailable
     ) {
       const extractions = await printExtractions(fixture, evidence);
 
-      if (RUN_NORMALIZATION || RUN_CLASSIFICATION) {
+      if (RUN_NORMALIZATION || RUN_CLASSIFICATION || RUN_VERDICTS) {
         const normalizedRows = printNormalizedCandidates(fixture, extractions);
 
-        if (RUN_CLASSIFICATION) {
-          printClassifiedCandidates(fixture, normalizedRows);
+        if (RUN_CLASSIFICATION || RUN_VERDICTS) {
+          const classifiedRows = printClassifiedCandidates(fixture, normalizedRows);
+
+          if (RUN_VERDICTS) {
+            printVerdict(fixture, classifiedRows);
+          }
         }
       }
+    } else if (RUN_VERDICTS && evidence.evidence_unavailable) {
+      printVerdict(fixture, [], true);
     }
   }
 }
