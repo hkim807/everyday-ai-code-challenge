@@ -1,16 +1,92 @@
 const API_BASE_URL =
   "https://everyday-sim-463015353641.us-east1.run.app/api/challenge";
 
-const SAMPLE_FIXTURE_COUNT = 3;
+const REQUEST_TIMEOUT_MS = 8_000;
+const MAX_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = 500;
+const FORCED_FAILURE_FIXTURE_ID = process.env.FORCE_EVIDENCE_FAILURE_ID;
 
-async function fetchJson(url) {
-  const response = await fetch(url);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  if (!response.ok) {
-    throw new Error(`GET ${url} failed: ${response.status} ${response.statusText}`);
+function isRetriableError(error) {
+  return error.name === "AbortError" || error.status === 503;
+}
+
+async function fetchJson(url, options = {}) {
+  const {
+    attempts = MAX_ATTEMPTS,
+    timeoutMs = REQUEST_TIMEOUT_MS,
+    retryBackoffMs = RETRY_BACKOFF_MS,
+  } = options;
+
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+
+      if (!response.ok) {
+        const error = new Error(
+          `GET ${url} failed: ${response.status} ${response.statusText}`,
+        );
+        error.status = response.status;
+        throw error;
+      }
+
+      return response.json();
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === attempts || !isRetriableError(error)) {
+        break;
+      }
+
+      const delay = retryBackoffMs * 2 ** (attempt - 1);
+      console.warn(
+        `GET ${url} failed on attempt ${attempt}/${attempts}; retrying in ${delay}ms: ${error.message}`,
+      );
+      await sleep(delay);
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
-  return response.json();
+  throw lastError;
+}
+
+function unavailableEvidence(fixtureId, error) {
+  return {
+    fixture_id: fixtureId,
+    evidence_unavailable: true,
+    evidence: [],
+    error: {
+      message: error.message,
+      status: error.status ?? null,
+      retriable: isRetriableError(error),
+    },
+  };
+}
+
+async function fetchEvidenceForFixture(fixtureId) {
+  try {
+    if (fixtureId === FORCED_FAILURE_FIXTURE_ID) {
+      const error = new Error(`Forced evidence failure for ${fixtureId}`);
+      error.status = "forced";
+      throw error;
+    }
+
+    return await fetchJson(`${API_BASE_URL}/fixtures/${fixtureId}/evidence`);
+  } catch (error) {
+    console.warn(
+      `Evidence unavailable for fixture ${fixtureId}; continuing run: ${error.message}`,
+    );
+    return unavailableEvidence(fixtureId, error);
+  }
 }
 
 function summarizeFieldNames(value, prefix = "") {
@@ -61,16 +137,15 @@ function groupEvidenceItems(evidencePayload) {
 async function main() {
   const fixtures = await fetchJson(`${API_BASE_URL}/fixtures`);
   const fixtureList = Array.isArray(fixtures) ? fixtures : fixtures.fixtures ?? [];
-  const selectedFixtures = fixtureList.slice(0, SAMPLE_FIXTURE_COUNT);
 
   console.log("=== Fixtures payload ===");
   console.dir(fixtures, { depth: null });
   console.log("\n=== Fixture field names observed ===");
   console.dir(summarizeFieldNames(fixtureList), { depth: null });
 
-  for (const fixture of selectedFixtures) {
+  for (const fixture of fixtureList) {
     const fixtureId = fixture.id;
-    const evidence = await fetchJson(`${API_BASE_URL}/fixtures/${fixtureId}/evidence`);
+    const evidence = await fetchEvidenceForFixture(fixtureId);
     const groupedEvidence = groupEvidenceItems(evidence);
 
     console.log(`\n=== Evidence payload for fixture ${fixtureId} ===`);
