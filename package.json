@@ -6,7 +6,8 @@
   "private": true,
   "scripts": {
     "start": "node index.js",
-    "extract": "RUN_EXTRACTION=1 node index.js"
+    "extract": "RUN_EXTRACTION=1 node index.js",
+    "normalize": "RUN_NORMALIZATION=1 node index.js"
   },
   "dependencies": {
     "luxon": "^3.5.0",

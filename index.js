@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { existsSync, readFileSync } from "node:fs";
+import { DateTime } from "luxon";
 
 const API_BASE_URL =
   "https://everyday-sim-463015353641.us-east1.run.app/api/challenge";
@@ -9,7 +10,64 @@ const MAX_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 500;
 const FORCED_FAILURE_FIXTURE_ID = process.env.FORCE_EVIDENCE_FAILURE_ID;
 const RUN_EXTRACTION = process.env.RUN_EXTRACTION === "1";
+const RUN_NORMALIZATION = process.env.RUN_NORMALIZATION === "1";
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
+
+const WEEKDAY_NUMBERS = new Map([
+  ["monday", 1],
+  ["mon", 1],
+  ["tuesday", 2],
+  ["tue", 2],
+  ["tues", 2],
+  ["wednesday", 3],
+  ["wed", 3],
+  ["thursday", 4],
+  ["thu", 4],
+  ["thur", 4],
+  ["thurs", 4],
+  ["friday", 5],
+  ["fri", 5],
+  ["saturday", 6],
+  ["sat", 6],
+  ["domingo", 7],
+  ["sunday", 7],
+  ["sun", 7],
+  ["lunes", 1],
+  ["martes", 2],
+  ["miercoles", 3],
+  ["miércoles", 3],
+  ["jueves", 4],
+  ["viernes", 5],
+  ["sabado", 6],
+  ["sábado", 6],
+]);
+
+const MONTH_NUMBERS = new Map([
+  ["january", 1],
+  ["jan", 1],
+  ["february", 2],
+  ["feb", 2],
+  ["march", 3],
+  ["mar", 3],
+  ["april", 4],
+  ["apr", 4],
+  ["may", 5],
+  ["june", 6],
+  ["jun", 6],
+  ["july", 7],
+  ["jul", 7],
+  ["august", 8],
+  ["aug", 8],
+  ["september", 9],
+  ["sep", 9],
+  ["sept", 9],
+  ["october", 10],
+  ["oct", 10],
+  ["november", 11],
+  ["nov", 11],
+  ["december", 12],
+  ["dec", 12],
+]);
 
 const extractionResponseFormat = {
   type: "json_schema",
@@ -388,10 +446,257 @@ async function extractKickoffFromEvidence(item, fixture) {
 async function printExtractions(fixture, evidence) {
   console.log(`\n=== Extraction results for fixture ${fixture.id} ===`);
 
-  for (const item of evidenceItems(evidence)) {
-    const extraction = await extractKickoffFromEvidence(item, fixture);
+  const extractions = await extractEvidenceForFixture(fixture, evidence);
+  for (const extraction of extractions) {
     console.dir(extraction, { depth: null });
   }
+
+  return extractions;
+}
+
+async function extractEvidenceForFixture(fixture, evidence) {
+  const extractions = [];
+
+  for (const item of evidenceItems(evidence)) {
+    extractions.push(await extractKickoffFromEvidence(item, fixture));
+  }
+
+  return extractions;
+}
+
+function zoneFromStatedTimezone(statedTimezone, venueTimezone) {
+  if (!statedTimezone) {
+    return venueTimezone;
+  }
+
+  const normalized = statedTimezone.trim().toLowerCase();
+  const zoneAliases = new Map([
+    ["et", "America/New_York"],
+    ["eastern", "America/New_York"],
+    ["eastern time", "America/New_York"],
+    ["est", "America/New_York"],
+    ["edt", "America/New_York"],
+    ["ct", "America/Chicago"],
+    ["central", "America/Chicago"],
+    ["central time", "America/Chicago"],
+    ["cst", "America/Chicago"],
+    ["cdt", "America/Chicago"],
+    ["mt", "America/Denver"],
+    ["mountain", "America/Denver"],
+    ["mountain time", "America/Denver"],
+    ["mst", "America/Denver"],
+    ["mdt", "America/Denver"],
+    ["pt", "America/Los_Angeles"],
+    ["pacific", "America/Los_Angeles"],
+    ["pacific time", "America/Los_Angeles"],
+    ["pst", "America/Los_Angeles"],
+    ["pdt", "America/Los_Angeles"],
+    ["hora de denver", "America/Denver"],
+    ["utc", "UTC"],
+  ]);
+
+  const aliasedZone = zoneAliases.get(normalized) ?? statedTimezone;
+  return DateTime.local().setZone(aliasedZone).isValid ? aliasedZone : venueTimezone;
+}
+
+function resolveReferenceDate(extraction, fixture, zone) {
+  const fixtureDate = DateTime.fromISO(fixture.kickoff_utc, {
+    zone: "utc",
+  }).setZone(zone);
+  const reference = extraction.referenced_date_or_weekday?.trim();
+
+  if (!reference) {
+    return fixtureDate;
+  }
+
+  const explicitDate = parseExplicitDate(reference, fixtureDate, zone);
+  if (explicitDate) {
+    return explicitDate;
+  }
+
+  const weekday = findWeekday(reference);
+  if (!weekday) {
+    return fixtureDate;
+  }
+
+  let candidate = fixtureDate;
+  for (let offset = -7; offset <= 7; offset += 1) {
+    const possible = fixtureDate.plus({ days: offset });
+    if (possible.weekday === weekday) {
+      if (
+        Math.abs(possible.startOf("day").diff(fixtureDate.startOf("day"), "days").days) <
+        Math.abs(candidate.startOf("day").diff(fixtureDate.startOf("day"), "days").days)
+      ) {
+        candidate = possible;
+      }
+    }
+  }
+
+  return candidate;
+}
+
+function parseExplicitDate(reference, fixtureDate, zone) {
+  const cleaned = reference.replace(/,/g, " ");
+  const dayMonthMatch = cleaned.match(
+    /\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)\b/i,
+  );
+  const monthDayMatch = cleaned.match(
+    /\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?\b/i,
+  );
+
+  const match = dayMonthMatch
+    ? { day: Number(dayMonthMatch[1]), monthText: dayMonthMatch[2] }
+    : monthDayMatch
+      ? { day: Number(monthDayMatch[2]), monthText: monthDayMatch[1] }
+      : null;
+
+  if (!match) {
+    return null;
+  }
+
+  const month = MONTH_NUMBERS.get(match.monthText.toLowerCase());
+  if (!month) {
+    return null;
+  }
+
+  const date = DateTime.fromObject(
+    { year: fixtureDate.year, month, day: match.day },
+    { zone },
+  );
+
+  return date.isValid ? date : null;
+}
+
+function findWeekday(reference) {
+  const normalized = reference.toLowerCase();
+  for (const [name, weekday] of WEEKDAY_NUMBERS.entries()) {
+    if (new RegExp(`\\b${name}\\b`, "i").test(normalized)) {
+      return weekday;
+    }
+  }
+
+  return null;
+}
+
+function parseLocalTime(timeText, date, zone) {
+  const normalized = timeText.trim().toUpperCase().replace(/\s+/g, " ");
+  const match = normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?$/);
+
+  if (!match) {
+    return { value: null, reason: `Unrecognized time format: ${timeText}` };
+  }
+
+  let hour = Number(match[1]);
+  const minute = match[2] ? Number(match[2]) : 0;
+  const meridiem = match[3];
+
+  if (meridiem === "PM" && hour < 12) {
+    hour += 12;
+  }
+
+  if (meridiem === "AM" && hour === 12) {
+    hour = 0;
+  }
+
+  const value = DateTime.fromObject(
+    {
+      year: date.year,
+      month: date.month,
+      day: date.day,
+      hour,
+      minute,
+    },
+    { zone },
+  );
+
+  return value.isValid
+    ? { value, reason: null }
+    : { value: null, reason: value.invalidExplanation ?? "Invalid local time" };
+}
+
+function normalizeExtractionToUtc(extraction, fixture) {
+  if (extraction.source_type === "feed_listing") {
+    const value = DateTime.fromISO(extraction.referenced_date_or_weekday, {
+      zone: "utc",
+    });
+
+    return {
+      source_id: extraction.source_id,
+      source_type: extraction.source_type,
+      candidate_kickoff_time_local: extraction.candidate_kickoff_time_local,
+      stated_timezone: extraction.stated_timezone,
+      referenced_date_or_weekday: extraction.referenced_date_or_weekday,
+      resolved_timezone: "UTC",
+      candidate_kickoff_utc: value.isValid ? value.toUTC().toISO() : null,
+      normalization_note: value.isValid
+        ? "ScoreFeed listed_kickoff_utc parsed directly."
+        : "ScoreFeed listed_kickoff_utc was not a valid ISO datetime.",
+    };
+  }
+
+  if (
+    !extraction.candidate_kickoff_time_local ||
+    !extraction.is_this_about_this_fixture ||
+    !extraction.is_this_actually_kickoff
+  ) {
+    return {
+      source_id: extraction.source_id,
+      source_type: extraction.source_type,
+      candidate_kickoff_time_local: extraction.candidate_kickoff_time_local,
+      stated_timezone: extraction.stated_timezone,
+      referenced_date_or_weekday: extraction.referenced_date_or_weekday,
+      resolved_timezone: null,
+      candidate_kickoff_utc: null,
+      normalization_note: "No valid kickoff candidate to normalize.",
+    };
+  }
+
+  const zone = zoneFromStatedTimezone(
+    extraction.stated_timezone,
+    fixture.venue?.timezone,
+  );
+  const date = resolveReferenceDate(extraction, fixture, zone);
+  const parsedTime = parseLocalTime(
+    extraction.candidate_kickoff_time_local,
+    date,
+    zone,
+  );
+
+  return {
+    source_id: extraction.source_id,
+    source_type: extraction.source_type,
+    candidate_kickoff_time_local: extraction.candidate_kickoff_time_local,
+    stated_timezone: extraction.stated_timezone,
+    referenced_date_or_weekday: extraction.referenced_date_or_weekday,
+    resolved_timezone: zone,
+    resolved_local_datetime: parsedTime.value?.toISO() ?? null,
+    candidate_kickoff_utc: parsedTime.value?.toUTC().toISO() ?? null,
+    normalization_note:
+      parsedTime.reason ??
+      `Resolved against fixture date using ${extraction.stated_timezone ? "stated timezone" : "venue timezone"}.`,
+  };
+}
+
+function printNormalizedCandidates(fixture, extractions) {
+  const rows = extractions.map((extraction) =>
+    normalizeExtractionToUtc(extraction, fixture),
+  );
+
+  console.log(`\n=== Normalized UTC candidates for fixture ${fixture.id} ===`);
+  console.table(
+    rows.map((row) => ({
+      source_id: row.source_id,
+      source_type: row.source_type,
+      local_time: row.candidate_kickoff_time_local,
+      stated_timezone: row.stated_timezone,
+      resolved_timezone: row.resolved_timezone,
+      reference: row.referenced_date_or_weekday,
+      candidate_kickoff_utc: row.candidate_kickoff_utc,
+      note: row.normalization_note,
+    })),
+  );
+
+  return rows;
 }
 
 async function main() {
@@ -422,8 +727,12 @@ async function main() {
       console.dir(summarizeFieldNames(items), { depth: null });
     }
 
-    if (RUN_EXTRACTION && !evidence.evidence_unavailable) {
-      await printExtractions(fixture, evidence);
+    if ((RUN_EXTRACTION || RUN_NORMALIZATION) && !evidence.evidence_unavailable) {
+      const extractions = await printExtractions(fixture, evidence);
+
+      if (RUN_NORMALIZATION) {
+        printNormalizedCandidates(fixture, extractions);
+      }
     }
   }
 }
