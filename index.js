@@ -11,7 +11,9 @@ const RETRY_BACKOFF_MS = 500;
 const FORCED_FAILURE_FIXTURE_ID = process.env.FORCE_EVIDENCE_FAILURE_ID;
 const RUN_EXTRACTION = process.env.RUN_EXTRACTION === "1";
 const RUN_NORMALIZATION = process.env.RUN_NORMALIZATION === "1";
+const RUN_CLASSIFICATION = process.env.RUN_CLASSIFICATION === "1";
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
+const FRESHNESS_WINDOW_DAYS = 14;
 
 const WEEKDAY_NUMBERS = new Map([
   ["monday", 1],
@@ -342,6 +344,8 @@ function parseFeedListing(item) {
   return {
     source_id: item.id,
     source_type: item.type,
+    provider: item.provider,
+    evidence_timestamp: item.retrieved_at ?? null,
     parsed_directly: true,
     candidate_kickoff_time_local: null,
     stated_timezone: "UTC",
@@ -351,6 +355,28 @@ function parseFeedListing(item) {
     is_this_actually_kickoff: Boolean(item.listed_kickoff_utc),
     extraction_confidence_note:
       "ScoreFeed listing is already structured; kept as UTC for later normalization.",
+  };
+}
+
+function sourceMetadata(item) {
+  if (item.type === "social_post") {
+    return {
+      platform: item.platform,
+      account: item.account ?? null,
+      evidence_timestamp: item.posted_at ?? null,
+    };
+  }
+
+  if (item.type === "web_page") {
+    return {
+      url: item.url,
+      title: item.title,
+      evidence_timestamp: item.fetched_at ?? null,
+    };
+  }
+
+  return {
+    evidence_timestamp: item.retrieved_at ?? item.fetched_at ?? item.posted_at ?? null,
   };
 }
 
@@ -438,6 +464,7 @@ async function extractKickoffFromEvidence(item, fixture) {
   return sanitizeExtraction({
     source_id: item.id,
     source_type: item.type,
+    ...sourceMetadata(item),
     parsed_directly: false,
     ...JSON.parse(response.output_text),
   });
@@ -623,6 +650,10 @@ function normalizeExtractionToUtc(extraction, fixture) {
     return {
       source_id: extraction.source_id,
       source_type: extraction.source_type,
+      provider: extraction.provider,
+      account: extraction.account,
+      url: extraction.url,
+      evidence_timestamp: extraction.evidence_timestamp,
       candidate_kickoff_time_local: extraction.candidate_kickoff_time_local,
       stated_timezone: extraction.stated_timezone,
       referenced_date_or_weekday: extraction.referenced_date_or_weekday,
@@ -642,6 +673,10 @@ function normalizeExtractionToUtc(extraction, fixture) {
     return {
       source_id: extraction.source_id,
       source_type: extraction.source_type,
+      provider: extraction.provider,
+      account: extraction.account,
+      url: extraction.url,
+      evidence_timestamp: extraction.evidence_timestamp,
       candidate_kickoff_time_local: extraction.candidate_kickoff_time_local,
       stated_timezone: extraction.stated_timezone,
       referenced_date_or_weekday: extraction.referenced_date_or_weekday,
@@ -665,6 +700,10 @@ function normalizeExtractionToUtc(extraction, fixture) {
   return {
     source_id: extraction.source_id,
     source_type: extraction.source_type,
+    provider: extraction.provider,
+    account: extraction.account,
+    url: extraction.url,
+    evidence_timestamp: extraction.evidence_timestamp,
     candidate_kickoff_time_local: extraction.candidate_kickoff_time_local,
     stated_timezone: extraction.stated_timezone,
     referenced_date_or_weekday: extraction.referenced_date_or_weekday,
@@ -699,6 +738,118 @@ function printNormalizedCandidates(fixture, extractions) {
   return rows;
 }
 
+function isOfficialSocialAccount(account, fixture) {
+  if (!account?.verified) {
+    return false;
+  }
+
+  const displayName = account.display_name?.toLowerCase() ?? "";
+  const handle = account.handle?.toLowerCase() ?? "";
+  const officialNames = [
+    fixture.home,
+    fixture.away,
+    fixture.competition,
+    "Continental Soccer League",
+    "CSLeague",
+  ].map((value) => value.toLowerCase());
+
+  return officialNames.some((name) => {
+    const compactName = name.replace(/[^a-z0-9]/g, "");
+    return (
+      displayName === name ||
+      displayName.includes(name) ||
+      handle.replace(/[^a-z0-9]/g, "").includes(compactName)
+    );
+  });
+}
+
+function classifyTrustTier(row, fixture) {
+  if (row.source_type === "feed_listing") {
+    return {
+      trust_tier: 2,
+      trust_label: "Tier 2 - ScoreFeed supporting context",
+    };
+  }
+
+  if (row.source_type === "social_post" && isOfficialSocialAccount(row.account, fixture)) {
+    return {
+      trust_tier: 1,
+      trust_label: "Tier 1 - verified official club/competition channel",
+    };
+  }
+
+  if (row.source_type === "web_page") {
+    return {
+      trust_tier: 3,
+      trust_label: "Tier 3 - web listing/snippet",
+    };
+  }
+
+  return {
+    trust_tier: 3,
+    trust_label: "Tier 3 - unverified or unsupported source",
+  };
+}
+
+function classifyFreshness(row, fixture) {
+  const evidenceTime = DateTime.fromISO(row.evidence_timestamp ?? "", { zone: "utc" });
+  const lastVerifiedAt = DateTime.fromISO(fixture.last_verified_at, { zone: "utc" });
+
+  if (!evidenceTime.isValid) {
+    return {
+      freshness: "unknown",
+      freshness_age_days: null,
+      freshness_note: "No valid evidence timestamp.",
+    };
+  }
+
+  if (!lastVerifiedAt.isValid) {
+    return {
+      freshness: "unknown",
+      freshness_age_days: null,
+      freshness_note: "No valid fixture last_verified_at timestamp.",
+    };
+  }
+
+  const ageDays = evidenceTime.diff(lastVerifiedAt, "days").days;
+  const freshness =
+    ageDays >= 0 && ageDays <= FRESHNESS_WINDOW_DAYS ? "fresh" : "stale";
+
+  return {
+    freshness,
+    freshness_age_days: Number(ageDays.toFixed(2)),
+    freshness_note: `${freshness} relative to last_verified_at using ${FRESHNESS_WINDOW_DAYS}-day window.`,
+  };
+}
+
+function classifyNormalizedCandidates(fixture, normalizedRows) {
+  return normalizedRows.map((row) => ({
+    ...row,
+    ...classifyTrustTier(row, fixture),
+    ...classifyFreshness(row, fixture),
+  }));
+}
+
+function printClassifiedCandidates(fixture, normalizedRows) {
+  const rows = classifyNormalizedCandidates(fixture, normalizedRows);
+
+  console.log(`\n=== Classified candidates for fixture ${fixture.id} ===`);
+  console.table(
+    rows.map((row) => ({
+      source_id: row.source_id,
+      source_type: row.source_type,
+      candidate_kickoff_utc: row.candidate_kickoff_utc,
+      trust_tier: row.trust_tier,
+      freshness: row.freshness,
+      evidence_timestamp: row.evidence_timestamp,
+      freshness_age_days: row.freshness_age_days,
+      label: row.trust_label,
+    })),
+  );
+
+  return rows;
+}
+
 async function main() {
   loadDotEnv();
 
@@ -727,11 +878,18 @@ async function main() {
       console.dir(summarizeFieldNames(items), { depth: null });
     }
 
-    if ((RUN_EXTRACTION || RUN_NORMALIZATION) && !evidence.evidence_unavailable) {
+    if (
+      (RUN_EXTRACTION || RUN_NORMALIZATION || RUN_CLASSIFICATION) &&
+      !evidence.evidence_unavailable
+    ) {
       const extractions = await printExtractions(fixture, evidence);
 
-      if (RUN_NORMALIZATION) {
-        printNormalizedCandidates(fixture, extractions);
+      if (RUN_NORMALIZATION || RUN_CLASSIFICATION) {
+        const normalizedRows = printNormalizedCandidates(fixture, extractions);
+
+        if (RUN_CLASSIFICATION) {
+          printClassifiedCandidates(fixture, normalizedRows);
+        }
       }
     }
   }
